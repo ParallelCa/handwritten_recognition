@@ -248,67 +248,6 @@ def predict_traditional(processed28: np.ndarray):
     pred = clf.predict(feat)[0]
     return int(pred)
 
-def batch_predict_images(
-    files,
-    model_name: str,
-    device: torch.device,
-):
-    """
-    对多张上传图片进行批量预测。
-    参数:
-        files: Streamlit 上传的文件列表
-        model_name: "SimpleCNN" / "ResNet18" / "HOG + SVM"
-        device: torch.device
-    返回:
-        results: List[dict]，包含 filename / model / pred / (prob)
-    """
-    results = []
-
-    for f in files:
-        try:
-            pil_img = Image.open(f).convert("RGB")
-        except Exception:
-            continue
-
-        # 预处理：PIL -> BGR -> processed28
-        img_bgr = pil_to_cv2_bgr(pil_img)
-        # 批量上传通常是白底黑字，和单图的“Upload image”一致 -> invert=True
-        processed28, _ = debug_preprocess_steps(
-            img_bgr,
-            output_size=(28, 28),
-            invert=True
-        )
-
-        # 根据模型名称选择预测函数
-        if model_name == "SimpleCNN":
-            pred, probs = predict_cnn(processed28, device)
-            top_prob = float(np.max(probs))
-            results.append({
-                "filename": f.name,
-                "model": "SimpleCNN",
-                "prediction": pred,
-                "top1_prob": top_prob,
-            })
-        elif model_name == "ResNet18":
-            pred, probs = predict_resnet(processed28, device)
-            top_prob = float(np.max(probs))
-            results.append({
-                "filename": f.name,
-                "model": "ResNet18",
-                "prediction": pred,
-                "top1_prob": top_prob,
-            })
-        else:  # HOG + SVM
-            pred = predict_traditional(processed28)
-            results.append({
-                "filename": f.name,
-                "model": "HOG + SVM",
-                "prediction": pred,
-                "top1_prob": None,  # SVM 没有概率输出
-            })
-
-    return results
-
 # ---------------- Real-time MNIST evaluation ----------------
 
 @st.cache_data(show_spinner=True)
@@ -562,55 +501,7 @@ def main():
             })
     else:
         st.info("Upload or draw an image to compare models.")
-    # ---------------- Batch image processing ----------------
-    st.markdown("---")
-    st.header("Batch processing: process multiple images at once")
 
-    st.write(
-        "You can upload multiple images at once. The system will apply the same "
-        "preprocessing pipeline (grayscale, binarization, unified 28×28 size, normalization) "
-        "and run the selected model on each image."
-    )
-
-    batch_files = st.file_uploader(
-        "Upload multiple digit images",
-        type=["png", "jpg", "jpeg"],
-        accept_multiple_files=True,
-        help="All images will be processed with the current model selection on the sidebar.",
-    )
-
-    if batch_files:
-        st.info(f"{len(batch_files)} files uploaded. Current model: **{model_name}**")
-
-        if st.button("Run batch prediction"):
-            with st.spinner("Running batch prediction..."):
-                batch_results = batch_predict_images(
-                    batch_files,
-                    model_name=model_name,
-                    device=device,
-                )
-
-            if len(batch_results) == 0:
-                st.warning("No valid images were processed.")
-            else:
-                # 转成表格显示
-                import pandas as pd
-                df = pd.DataFrame(batch_results)
-                # 让 top1_prob 更好看一点（保留 4 位小数）
-                if "top1_prob" in df.columns:
-                    df["top1_prob"] = df["top1_prob"].apply(
-                        lambda x: None if x is None else round(float(x), 4)
-                    )
-
-                st.subheader("Batch prediction results")
-                st.dataframe(df, use_container_width=True)
-
-                st.write(
-                    "For HOG + SVM, the `top1_prob` column is `None` because the SVM "
-                    "pipeline does not output calibrated probabilities."
-                )
-    else:
-        st.info("Upload multiple images above to perform batch prediction.")
     # ---------------- Real-time evaluation ----------------
     st.markdown("---")
     st.header("Real-time MNIST evaluation")
