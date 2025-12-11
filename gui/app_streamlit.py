@@ -12,28 +12,60 @@ from torchvision import models, datasets, transforms
 import streamlit as st
 from PIL import Image
 
-from sklearn.metrics import confusion_matrix, accuracy_score
-from sklearn.metrics import ConfusionMatrixDisplay
+from sklearn.metrics import (
+    accuracy_score,
+    recall_score,
+    f1_score,
+    confusion_matrix,
+    ConfusionMatrixDisplay,
+)
 import matplotlib.pyplot as plt
 
-import cv2  # 用于图像预处理与可视化
+import cv2  # 用于图像预处理
 
-# canvas (optional)
+from joblib import load
+
+# 可选：画布输入
 try:
     from streamlit_drawable_canvas import st_canvas
     HAS_CANVAS = True
 except ImportError:
     HAS_CANVAS = False
 
-# project path
+# -------------- project path --------------
 BASE_DIR = Path(__file__).resolve().parents[1]
 if str(BASE_DIR) not in sys.path:
     sys.path.append(str(BASE_DIR))
+# -----------------------------------------
 
 from models.cnn import SimpleCNN
 from utils.datasets import preprocess_numpy_to_tensor
 from utils.traditional import hog_from_numpy
-from joblib import load
+
+
+# ---------------- Metric helpers ----------------
+
+def compute_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> Dict[str, float]:
+    """
+    计算 Accuracy、宏平均 Recall 和宏平均 F1-score。
+    """
+    return {
+        "accuracy": accuracy_score(y_true, y_pred),
+        "recall": recall_score(y_true, y_pred, average="macro"),
+        "f1": f1_score(y_true, y_pred, average="macro"),
+    }
+
+
+def plot_cm(cm: np.ndarray, title: str):
+    """
+    画混淆矩阵，并返回 matplotlib Figure，方便在 Streamlit 中显示。
+    """
+    fig, ax = plt.subplots(figsize=(4, 4))
+    disp = ConfusionMatrixDisplay(cm, display_labels=list(range(10)))
+    disp.plot(ax=ax, cmap="Blues", values_format="d", colorbar=False)
+    plt.title(title)
+    plt.tight_layout()
+    return fig
 
 
 # ---------------- Utility functions ----------------
@@ -48,7 +80,7 @@ def pil_to_cv2_bgr(img_pil: Image.Image) -> np.ndarray:
 def preprocess_for_resnet_from_processed28(img28: np.ndarray, device: torch.device):
     """
     已经是 28×28 单通道的 float32 [0,1] 图像，
-    转成 3×224×224 的张量，并做与训练时一致的归一化。
+    转成 3×224×224 的张量，并做与 ResNet 训练时一致的归一化。
     """
     tensor = torch.from_numpy(img28).unsqueeze(0).unsqueeze(0)  # (1,1,28,28)
     tensor = tensor.to(device=device, dtype=torch.float32)
@@ -63,6 +95,9 @@ def preprocess_for_resnet_from_processed28(img28: np.ndarray, device: torch.devi
 
 
 def topk_from_probs(probs: np.ndarray, k: int = 3):
+    """
+    给定概率向量，返回 top-k 的类别及其概率。
+    """
     k = min(k, probs.shape[0])
     idx = np.argsort(probs)[-k:][::-1]
     return idx, probs[idx]
@@ -87,25 +122,23 @@ def debug_preprocess_steps(
     gray_blur = cv2.GaussianBlur(gray, (3, 3), 0)
 
     # Step 2: Binarization（Otsu + 反二值化，得到黑底白字）
+    # 对于“上传的白底黑字”图片：使用 THRESH_BINARY_INV + OTSU -> 黑底白字
     _, thresh = cv2.threshold(
         gray_blur, 0, 255,
         cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU
     )
 
-    # 对于画布（已经是黑底白字）则不需要再反色
+    # 如果是画布（已经是黑底白字），可以选择不反，交给 invert 参数控制
     if not invert:
         thresh = 255 - thresh
 
-    # 找非零区域
+    # 找非零区域（数字区域）
     coords = cv2.findNonZero(thresh)
     if coords is None:
         blank = np.zeros(output_size, dtype=np.float32)
         steps = {
             "gray": gray,
-            "blur": gray_blur,
             "thresh": thresh,
-            "roi": np.zeros_like(thresh),
-            "resized": np.zeros(output_size, dtype=np.uint8),
             "canvas": np.zeros(output_size, dtype=np.uint8),
         }
         return blank, steps
@@ -127,7 +160,6 @@ def debug_preprocess_steps(
     new_w = int(roi_w * scale)
     new_h = int(roi_h * scale)
 
-    # 最近邻插值，避免边缘模糊
     digit_resized = cv2.resize(
         digit_roi, (new_w, new_h), interpolation=cv2.INTER_NEAREST
     )
@@ -141,12 +173,9 @@ def debug_preprocess_steps(
     processed28 = canvas.astype(np.float32) / 255.0
 
     steps = {
-        "gray": gray,
-        "blur": gray_blur,
-        "thresh": thresh,
-        "roi": digit_roi,
-        "resized": digit_resized,
-        "canvas": canvas,
+        "gray": gray,          # Step 1
+        "thresh": thresh,      # Step 2
+        "canvas": canvas,      # Step 3（统一尺寸）
     }
     return processed28, steps
 
@@ -219,11 +248,74 @@ def predict_traditional(processed28: np.ndarray):
     pred = clf.predict(feat)[0]
     return int(pred)
 
+def batch_predict_images(
+    files,
+    model_name: str,
+    device: torch.device,
+):
+    """
+    对多张上传图片进行批量预测。
+    参数:
+        files: Streamlit 上传的文件列表
+        model_name: "SimpleCNN" / "ResNet18" / "HOG + SVM"
+        device: torch.device
+    返回:
+        results: List[dict]，包含 filename / model / pred / (prob)
+    """
+    results = []
 
-# ---------------- Real-time model evaluation ----------------
+    for f in files:
+        try:
+            pil_img = Image.open(f).convert("RGB")
+        except Exception:
+            continue
+
+        # 预处理：PIL -> BGR -> processed28
+        img_bgr = pil_to_cv2_bgr(pil_img)
+        # 批量上传通常是白底黑字，和单图的“Upload image”一致 -> invert=True
+        processed28, _ = debug_preprocess_steps(
+            img_bgr,
+            output_size=(28, 28),
+            invert=True
+        )
+
+        # 根据模型名称选择预测函数
+        if model_name == "SimpleCNN":
+            pred, probs = predict_cnn(processed28, device)
+            top_prob = float(np.max(probs))
+            results.append({
+                "filename": f.name,
+                "model": "SimpleCNN",
+                "prediction": pred,
+                "top1_prob": top_prob,
+            })
+        elif model_name == "ResNet18":
+            pred, probs = predict_resnet(processed28, device)
+            top_prob = float(np.max(probs))
+            results.append({
+                "filename": f.name,
+                "model": "ResNet18",
+                "prediction": pred,
+                "top1_prob": top_prob,
+            })
+        else:  # HOG + SVM
+            pred = predict_traditional(processed28)
+            results.append({
+                "filename": f.name,
+                "model": "HOG + SVM",
+                "prediction": pred,
+                "top1_prob": None,  # SVM 没有概率输出
+            })
+
+    return results
+
+# ---------------- Real-time MNIST evaluation ----------------
 
 @st.cache_data(show_spinner=True)
 def evaluate_cnn(test_samples: int, device_str: str):
+    """
+    返回：metrics(dict: accuracy/recall/f1) + confusion matrix
+    """
     device = torch.device(device_str)
     data_root = BASE_DIR / "data"
 
@@ -233,7 +325,6 @@ def evaluate_cnn(test_samples: int, device_str: str):
     ])
 
     full_test = datasets.MNIST(root=data_root, train=False, download=True, transform=transform)
-
     ds = Subset(full_test, range(min(test_samples, len(full_test))))
     loader = DataLoader(ds, batch_size=128, shuffle=False, num_workers=0)
 
@@ -250,11 +341,17 @@ def evaluate_cnn(test_samples: int, device_str: str):
 
     y_pred = np.concatenate(preds)
     y_true = np.concatenate(labels)
-    return accuracy_score(y_true, y_pred), confusion_matrix(y_true, y_pred)
+
+    metrics = compute_metrics(y_true, y_pred)
+    cm = confusion_matrix(y_true, y_pred)
+    return metrics, cm
 
 
 @st.cache_data(show_spinner=True)
 def evaluate_traditional(test_samples: int):
+    """
+    HOG+SVM：返回 metrics + confusion matrix
+    """
     data_root = BASE_DIR / "data"
     transform = transforms.ToTensor()
     full_test = datasets.MNIST(root=data_root, train=False, download=True, transform=transform)
@@ -271,11 +368,17 @@ def evaluate_traditional(test_samples: int):
     X = np.stack(feats)
     y_true = np.array(labels)
     y_pred = clf.predict(X)
-    return accuracy_score(y_true, y_pred), confusion_matrix(y_true, y_pred)
+
+    metrics = compute_metrics(y_true, y_pred)
+    cm = confusion_matrix(y_true, y_pred)
+    return metrics, cm
 
 
 @st.cache_data(show_spinner=True)
 def evaluate_resnet(test_samples: int, device_str: str):
+    """
+    ResNet18：返回 metrics + confusion matrix
+    """
     device = torch.device(device_str)
     data_root = BASE_DIR / "data"
 
@@ -287,7 +390,6 @@ def evaluate_resnet(test_samples: int, device_str: str):
     ])
 
     full_test = datasets.MNIST(root=data_root, train=False, download=True, transform=transform)
-
     ds = Subset(full_test, range(min(test_samples, len(full_test))))
     loader = DataLoader(ds, batch_size=64, shuffle=False, num_workers=0)
 
@@ -304,16 +406,10 @@ def evaluate_resnet(test_samples: int, device_str: str):
 
     y_pred = np.concatenate(preds)
     y_true = np.concatenate(labels)
-    return accuracy_score(y_true, y_pred), confusion_matrix(y_true, y_pred)
 
-
-def plot_cm(cm: np.ndarray, title: str):
-    fig, ax = plt.subplots(figsize=(4, 4))
-    disp = ConfusionMatrixDisplay(cm, display_labels=list(range(10)))
-    disp.plot(ax=ax, cmap="Blues", values_format="d", colorbar=False)
-    plt.title(title)
-    plt.tight_layout()
-    return fig
+    metrics = compute_metrics(y_true, y_pred)
+    cm = confusion_matrix(y_true, y_pred)
+    return metrics, cm
 
 
 # ---------------- Streamlit UI ----------------
@@ -324,7 +420,7 @@ def main():
     st.title("Handwritten Digit Recognition Demo")
     st.write(
         "This interface demonstrates three models:\n"
-        "- HOG + SVM\n"
+        "- HOG + SVM (traditional baseline)\n"
         "- SimpleCNN\n"
         "- ResNet18\n"
     )
@@ -409,7 +505,6 @@ def main():
             # ---- Step 3: Unified image size ----
             st.markdown("### Step 3: Unified image size (28×28)")
             st.write("Resize the digit while keeping aspect ratio, then center it on a fixed 28×28 canvas.")
-
             st.image(steps["canvas"], caption="Centered 28×28 canvas", width=200)
 
             # ---- Step 4: Normalization ----
@@ -467,32 +562,136 @@ def main():
             })
     else:
         st.info("Upload or draw an image to compare models.")
+    # ---------------- Batch image processing ----------------
+    st.markdown("---")
+    st.header("Batch processing: process multiple images at once")
 
+    st.write(
+        "You can upload multiple images at once. The system will apply the same "
+        "preprocessing pipeline (grayscale, binarization, unified 28×28 size, normalization) "
+        "and run the selected model on each image."
+    )
+
+    batch_files = st.file_uploader(
+        "Upload multiple digit images",
+        type=["png", "jpg", "jpeg"],
+        accept_multiple_files=True,
+        help="All images will be processed with the current model selection on the sidebar.",
+    )
+
+    if batch_files:
+        st.info(f"{len(batch_files)} files uploaded. Current model: **{model_name}**")
+
+        if st.button("Run batch prediction"):
+            with st.spinner("Running batch prediction..."):
+                batch_results = batch_predict_images(
+                    batch_files,
+                    model_name=model_name,
+                    device=device,
+                )
+
+            if len(batch_results) == 0:
+                st.warning("No valid images were processed.")
+            else:
+                # 转成表格显示
+                import pandas as pd
+                df = pd.DataFrame(batch_results)
+                # 让 top1_prob 更好看一点（保留 4 位小数）
+                if "top1_prob" in df.columns:
+                    df["top1_prob"] = df["top1_prob"].apply(
+                        lambda x: None if x is None else round(float(x), 4)
+                    )
+
+                st.subheader("Batch prediction results")
+                st.dataframe(df, use_container_width=True)
+
+                st.write(
+                    "For HOG + SVM, the `top1_prob` column is `None` because the SVM "
+                    "pipeline does not output calibrated probabilities."
+                )
+    else:
+        st.info("Upload multiple images above to perform batch prediction.")
     # ---------------- Real-time evaluation ----------------
     st.markdown("---")
     st.header("Real-time MNIST evaluation")
 
     if st.button("Run Evaluation"):
         with st.spinner("Evaluating models..."):
-            acc_cnn, cm_cnn = evaluate_cnn(cnn_n, device_str)
-            acc_trad, cm_trad = evaluate_traditional(trad_n)
-            acc_resnet, cm_resnet = evaluate_resnet(resnet_n, device_str)
+            cnn_metrics, cm_cnn = evaluate_cnn(cnn_n, device_str)
+            trad_metrics, cm_trad = evaluate_traditional(trad_n)
+            resnet_metrics, cm_resnet = evaluate_resnet(resnet_n, device_str)
 
-        st.subheader("Summary")
+        st.subheader("Evaluation Metrics (MNIST test subsets)")
+
         st.table({
             "Model": ["SimpleCNN", "HOG+SVM", "ResNet18"],
             "Samples": [cnn_n, trad_n, resnet_n],
-            "Accuracy": [acc_cnn, acc_trad, acc_resnet],
+            "Accuracy": [
+                cnn_metrics["accuracy"],
+                trad_metrics["accuracy"],
+                resnet_metrics["accuracy"],
+            ],
+            "Recall": [
+                cnn_metrics["recall"],
+                trad_metrics["recall"],
+                resnet_metrics["recall"],
+            ],
+            "F1-score": [
+                cnn_metrics["f1"],
+                trad_metrics["f1"],
+                resnet_metrics["f1"],
+            ],
         })
 
+        st.subheader("Confusion Matrices")
         c1, c2, c3 = st.columns(3)
         with c1:
-            st.pyplot(plot_cm(cm_cnn, "CNN"))
+            st.pyplot(plot_cm(cm_cnn, "SimpleCNN"))
         with c2:
             st.pyplot(plot_cm(cm_trad, "HOG + SVM"))
         with c3:
             st.pyplot(plot_cm(cm_resnet, "ResNet18"))
+        # ---------------- Performance Curves ----------------
+        st.markdown("---")
+        st.header("Performance Curves")
 
+        st.write(
+            "Here we show pre-computed training and validation curves as well as "
+            "learning curves for the three models. These figures are generated "
+            "offline in the training scripts and loaded here for visualization."
+        )
+
+        curves_dir = BASE_DIR / "experiments"
+
+        # 一行三列：CNN / HOG+SVM / ResNet
+        col_cnn, col_trad, col_res = st.columns(3)
+
+        # ----- SimpleCNN 曲线 -----
+        with col_cnn:
+            st.subheader("SimpleCNN")
+            cnn_curve_path = curves_dir / "cnn_training_curves.png"
+            if cnn_curve_path.exists():
+                st.image(str(cnn_curve_path), caption="Training & Validation Curves", use_container_width=True)
+            else:
+                st.info("cnn_training_curves.png not found in experiments/")
+
+        # ----- HOG+SVM 曲线（learning curve） -----
+        with col_trad:
+            st.subheader("HOG + SVM")
+            hog_curve_path = curves_dir / "hog_svm_learning_curve.png"
+            if hog_curve_path.exists():
+                st.image(str(hog_curve_path), caption="Learning Curve (train size vs CV accuracy)", use_container_width=True)
+            else:
+                st.info("hog_svm_learning_curve.png not found in experiments/")
+
+        # ----- ResNet18 曲线 -----
+        with col_res:
+            st.subheader("ResNet18")
+            resnet_curve_path = curves_dir / "resnet_training_curves.png"
+            if resnet_curve_path.exists():
+                st.image(str(resnet_curve_path), caption="Training & Validation Curves", use_container_width=True)
+            else:
+                st.info("resnet_training_curves.png not found in experiments/")
 
 if __name__ == "__main__":
     main()

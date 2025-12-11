@@ -161,7 +161,7 @@ def plot_history(history, save_path):
 def main():
     # ======= config (fast version) =======
     batch_size = 64
-    num_epochs = 10          # fewer epochs for speed
+    num_epochs = 2          # fewer epochs for speed
     learning_rate = 1e-3
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")

@@ -121,7 +121,7 @@ def main():
     # 1. Basic configuration
     # =========================
     batch_size = 64
-    num_epochs = 10
+    num_epochs = 2
     learning_rate = 1e-3
 
     # Select device

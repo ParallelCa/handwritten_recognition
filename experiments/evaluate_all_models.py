@@ -7,10 +7,16 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, Subset
 from torchvision import datasets, transforms, models
 
-from sklearn.metrics import confusion_matrix, accuracy_score
+from sklearn.metrics import (
+    confusion_matrix,
+    accuracy_score,
+    recall_score,
+    f1_score
+)
 from sklearn.metrics import ConfusionMatrixDisplay
 import matplotlib.pyplot as plt
 from joblib import load
+
 
 # --------- project root import hack ----------
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -23,7 +29,16 @@ from models.cnn import SimpleCNN
 from utils.traditional import hog_from_tensor
 
 
-# --------------- common helpers ----------------
+# --------------- helpers ----------------
+
+def compute_metrics(y_true, y_pred):
+    """Return a dict of accuracy, macro recall, macro f1."""
+    return {
+        "accuracy": accuracy_score(y_true, y_pred),
+        "recall": recall_score(y_true, y_pred, average="macro"),
+        "f1": f1_score(y_true, y_pred, average="macro"),
+    }
+
 
 def save_confusion_matrix(cm: np.ndarray, title: str, save_path: str):
     """Plot and save confusion matrix as an image."""
@@ -82,15 +97,18 @@ def evaluate_cnn(device: torch.device):
     y_pred = np.concatenate(all_preds)
     y_true = np.concatenate(all_labels)
 
-    acc = accuracy_score(y_true, y_pred)
+    metrics = compute_metrics(y_true, y_pred)
     cm = confusion_matrix(y_true, y_pred)
 
-    print(f"SimpleCNN accuracy on full MNIST test set: {acc:.4f}")
+    print("\nSimpleCNN Metrics:")
+    print(f"  Accuracy: {metrics['accuracy']:.4f}")
+    print(f"  Recall:   {metrics['recall']:.4f}")
+    print(f"  F1-score: {metrics['f1']:.4f}")
 
     save_path = os.path.join(PROJECT_ROOT, "experiments", "cnn_confusion.png")
     save_confusion_matrix(cm, "SimpleCNN Confusion Matrix", save_path)
 
-    return acc, cm
+    return metrics, cm
 
 
 # ==================================================
@@ -119,29 +137,29 @@ def evaluate_traditional(max_test_samples: int = 5000):
 
     clf = load(model_path)
 
-    all_features = []
-    all_labels = []
+    all_features, all_labels = [], []
 
     for img_tensor, label in test_dataset:
-        # img_tensor: (1, 28, 28) in [0, 1]
         feat = hog_from_tensor(img_tensor)
         all_features.append(feat)
         all_labels.append(label)
 
     X_test = np.stack(all_features, axis=0)
     y_true = np.array(all_labels, dtype=np.int64)
-
     y_pred = clf.predict(X_test)
 
-    acc = accuracy_score(y_true, y_pred)
+    metrics = compute_metrics(y_true, y_pred)
     cm = confusion_matrix(y_true, y_pred)
 
-    print(f"HOG + SVM accuracy on MNIST test subset ({test_size} samples): {acc:.4f}")
+    print("\nHOG + SVM Metrics:")
+    print(f"  Accuracy: {metrics['accuracy']:.4f}")
+    print(f"  Recall:   {metrics['recall']:.4f}")
+    print(f"  F1-score: {metrics['f1']:.4f}")
 
     save_path = os.path.join(PROJECT_ROOT, "experiments", "hog_svm_confusion.png")
     save_confusion_matrix(cm, "HOG + SVM Confusion Matrix", save_path)
 
-    return acc, cm
+    return metrics, cm
 
 
 # ==================================================
@@ -149,7 +167,6 @@ def evaluate_traditional(max_test_samples: int = 5000):
 # ==================================================
 
 def expand_to_3_channels(x: torch.Tensor) -> torch.Tensor:
-    """(1, H, W) -> (3, H, W) by repeating channel."""
     return x.expand(3, -1, -1)
 
 
@@ -158,13 +175,11 @@ def evaluate_resnet(device: torch.device, max_test_samples: int = 2000):
 
     data_root = os.path.join(PROJECT_ROOT, "data")
 
-    # same transform as training
     common_transforms = transforms.Compose([
         transforms.Resize((224, 224)),
-        transforms.ToTensor(),                    # (1, 224, 224)
-        transforms.Lambda(expand_to_3_channels),  # (3, 224, 224)
-        transforms.Normalize(mean=[0.5, 0.5, 0.5],
-                             std=[0.5, 0.5, 0.5]),
+        transforms.ToTensor(),
+        transforms.Lambda(expand_to_3_channels),
+        transforms.Normalize([0.5]*3, [0.5]*3),
     ])
 
     test_dataset_full = datasets.MNIST(
@@ -177,18 +192,12 @@ def evaluate_resnet(device: torch.device, max_test_samples: int = 2000):
     test_size = min(len(test_dataset_full), max_test_samples)
     test_dataset = Subset(test_dataset_full, range(test_size))
 
-    test_loader = DataLoader(
-        test_dataset,
-        batch_size=64,
-        shuffle=False,
-        num_workers=0
-    )
+    test_loader = DataLoader(test_dataset, batch_size=64, shuffle=False, num_workers=0)
 
     model_path = os.path.join(PROJECT_ROOT, "models", "resnet18_mnist.pth")
     if not os.path.exists(model_path):
         raise FileNotFoundError(f"Cannot find ResNet18 model: {model_path}")
 
-    # define model
     model = models.resnet18(weights=None)
     in_features = model.fc.in_features
     model.fc = torch.nn.Linear(in_features, 10)
@@ -197,8 +206,7 @@ def evaluate_resnet(device: torch.device, max_test_samples: int = 2000):
     model.to(device)
     model.eval()
 
-    all_preds = []
-    all_labels = []
+    all_preds, all_labels = [], []
 
     with torch.no_grad():
         for images, labels in test_loader:
@@ -214,15 +222,18 @@ def evaluate_resnet(device: torch.device, max_test_samples: int = 2000):
     y_pred = np.concatenate(all_preds)
     y_true = np.concatenate(all_labels)
 
-    acc = accuracy_score(y_true, y_pred)
+    metrics = compute_metrics(y_true, y_pred)
     cm = confusion_matrix(y_true, y_pred)
 
-    print(f"ResNet18 accuracy on MNIST test subset ({test_size} samples): {acc:.4f}")
+    print("\nResNet18 Metrics:")
+    print(f"  Accuracy: {metrics['accuracy']:.4f}")
+    print(f"  Recall:   {metrics['recall']:.4f}")
+    print(f"  F1-score: {metrics['f1']:.4f}")
 
     save_path = os.path.join(PROJECT_ROOT, "experiments", "resnet_confusion.png")
     save_confusion_matrix(cm, "ResNet18 Confusion Matrix", save_path)
 
-    return acc, cm
+    return metrics, cm
 
 
 # ==================================================
@@ -233,19 +244,14 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print("Using device:", device)
 
-    # 1) CNN
-    cnn_acc, _ = evaluate_cnn(device)
+    cnn_metrics, _ = evaluate_cnn(device)
+    trad_metrics, _ = evaluate_traditional(max_test_samples=5000)
+    resnet_metrics, _ = evaluate_resnet(device, max_test_samples=2000)
 
-    # 2) HOG + SVM
-    trad_acc, _ = evaluate_traditional(max_test_samples=5000)
-
-    # 3) ResNet18
-    resnet_acc, _ = evaluate_resnet(device, max_test_samples=2000)
-
-    print("\n=== Summary of accuracies ===")
-    print(f"SimpleCNN (full 10k test):   {cnn_acc:.4f}")
-    print(f"HOG + SVM (5k test subset): {trad_acc:.4f}")
-    print(f"ResNet18 (2k test subset):  {resnet_acc:.4f}")
+    print("\n=== Summary of Evaluation Metrics ===")
+    print(f"SimpleCNN : Acc={cnn_metrics['accuracy']:.4f}, Rec={cnn_metrics['recall']:.4f}, F1={cnn_metrics['f1']:.4f}")
+    print(f"HOG+SVM   : Acc={trad_metrics['accuracy']:.4f}, Rec={trad_metrics['recall']:.4f}, F1={trad_metrics['f1']:.4f}")
+    print(f"ResNet18  : Acc={resnet_metrics['accuracy']:.4f}, Rec={resnet_metrics['recall']:.4f}, F1={resnet_metrics['f1']:.4f}")
 
 
 if __name__ == "__main__":
