@@ -3,7 +3,6 @@ import sys
 
 import numpy as np
 import torch
-import torch.nn.functional as F
 from torch.utils.data import DataLoader, Subset
 from torchvision import datasets, transforms, models
 
@@ -18,21 +17,19 @@ import matplotlib.pyplot as plt
 from joblib import load
 
 
-# --------- project root import hack ----------
+# Add project root to Python path for local imports
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.dirname(CURRENT_DIR)
 if PROJECT_ROOT not in sys.path:
     sys.path.append(PROJECT_ROOT)
-# ---------------------------------------------
 
 from models.cnn import SimpleCNN
 from utils.traditional import hog_from_tensor
+from utils.datasets import get_mnist_dataloaders
 
-
-# --------------- helpers ----------------
 
 def compute_metrics(y_true, y_pred):
-    """Return a dict of accuracy, macro recall, macro f1."""
+    """Compute Accuracy, Macro Recall, and Macro F1."""
     return {
         "accuracy": accuracy_score(y_true, y_pred),
         "recall": recall_score(y_true, y_pred, average="macro"),
@@ -41,35 +38,31 @@ def compute_metrics(y_true, y_pred):
 
 
 def save_confusion_matrix(cm: np.ndarray, title: str, save_path: str):
-    """Plot and save confusion matrix as an image."""
+    """Save confusion matrix plot for reporting."""
     disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=list(range(10)))
     fig, ax = plt.subplots(figsize=(6, 6))
     disp.plot(ax=ax, cmap="Blues", values_format="d", colorbar=False)
     plt.title(title)
     plt.tight_layout()
+    os.makedirs(os.path.dirname(save_path), exist_ok=True)
     plt.savefig(save_path)
     plt.close()
     print(f"Saved confusion matrix to: {save_path}")
 
 
-# ==================================================
-# 1) Evaluate CNN (SimpleCNN)
-# ==================================================
-
 def evaluate_cnn(device: torch.device):
-    from utils.datasets import get_mnist_dataloaders
-
     print("\n=== Evaluating SimpleCNN on MNIST test set ===")
 
-    # get data (no augmentation for test)
-    _, test_loader = get_mnist_dataloaders(
+    # Use only the official test set for evaluation
+    _, _, test_loader = get_mnist_dataloaders(
         data_root=os.path.join(PROJECT_ROOT, "data"),
         batch_size=128,
         num_workers=0,
-        use_augmentation=False
+        use_augmentation=False,
+        val_split=0.1,
+        seed=42
     )
 
-    # load model
     model_path = os.path.join(PROJECT_ROOT, "models", "cnn_best.pth")
     if not os.path.exists(model_path):
         raise FileNotFoundError(f"Cannot find CNN model: {model_path}")
@@ -106,17 +99,13 @@ def evaluate_cnn(device: torch.device):
     print(f"  F1-score: {metrics['f1']:.4f}")
 
     save_path = os.path.join(PROJECT_ROOT, "experiments", "cnn_confusion.png")
-    save_confusion_matrix(cm, "SimpleCNN Confusion Matrix", save_path)
+    save_confusion_matrix(cm, "SimpleCNN Confusion Matrix (TEST)", save_path)
 
     return metrics, cm
 
 
-# ==================================================
-# 2) Evaluate traditional model (HOG + SVM)
-# ==================================================
-
 def evaluate_traditional(max_test_samples: int = 5000):
-    print("\n=== Evaluating HOG + SVM on MNIST test subset ===")
+    print("\n=== Evaluating HOG + SVM on MNIST test subset (deterministic) ===")
 
     data_root = os.path.join(PROJECT_ROOT, "data")
     transform = transforms.ToTensor()
@@ -129,6 +118,7 @@ def evaluate_traditional(max_test_samples: int = 5000):
     )
 
     test_size = min(len(test_dataset_full), max_test_samples)
+    # Deterministic subset for reproducibility
     test_dataset = Subset(test_dataset_full, range(test_size))
 
     model_path = os.path.join(PROJECT_ROOT, "models", "traditional_hog_svm.joblib")
@@ -157,21 +147,18 @@ def evaluate_traditional(max_test_samples: int = 5000):
     print(f"  F1-score: {metrics['f1']:.4f}")
 
     save_path = os.path.join(PROJECT_ROOT, "experiments", "hog_svm_confusion.png")
-    save_confusion_matrix(cm, "HOG + SVM Confusion Matrix", save_path)
+    save_confusion_matrix(cm, "HOG + SVM Confusion Matrix (TEST subset)", save_path)
 
     return metrics, cm
 
 
-# ==================================================
-# 3) Evaluate ResNet18
-# ==================================================
-
 def expand_to_3_channels(x: torch.Tensor) -> torch.Tensor:
+    # ResNet expects 3-channel input
     return x.expand(3, -1, -1)
 
 
 def evaluate_resnet(device: torch.device, max_test_samples: int = 2000):
-    print("\n=== Evaluating ResNet18 on MNIST test subset ===")
+    print("\n=== Evaluating ResNet18 on MNIST test subset (deterministic) ===")
 
     data_root = os.path.join(PROJECT_ROOT, "data")
 
@@ -190,6 +177,7 @@ def evaluate_resnet(device: torch.device, max_test_samples: int = 2000):
     )
 
     test_size = min(len(test_dataset_full), max_test_samples)
+    # Deterministic subset for reproducibility
     test_dataset = Subset(test_dataset_full, range(test_size))
 
     test_loader = DataLoader(test_dataset, batch_size=64, shuffle=False, num_workers=0)
@@ -201,6 +189,7 @@ def evaluate_resnet(device: torch.device, max_test_samples: int = 2000):
     model = models.resnet18(weights=None)
     in_features = model.fc.in_features
     model.fc = torch.nn.Linear(in_features, 10)
+
     state_dict = torch.load(model_path, map_location=device)
     model.load_state_dict(state_dict)
     model.to(device)
@@ -231,14 +220,10 @@ def evaluate_resnet(device: torch.device, max_test_samples: int = 2000):
     print(f"  F1-score: {metrics['f1']:.4f}")
 
     save_path = os.path.join(PROJECT_ROOT, "experiments", "resnet_confusion.png")
-    save_confusion_matrix(cm, "ResNet18 Confusion Matrix", save_path)
+    save_confusion_matrix(cm, "ResNet18 Confusion Matrix (TEST subset)", save_path)
 
     return metrics, cm
 
-
-# ==================================================
-# main
-# ==================================================
 
 def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -248,7 +233,7 @@ def main():
     trad_metrics, _ = evaluate_traditional(max_test_samples=5000)
     resnet_metrics, _ = evaluate_resnet(device, max_test_samples=2000)
 
-    print("\n=== Summary of Evaluation Metrics ===")
+    print("\n=== Summary of Evaluation Metrics (TEST / deterministic subsets) ===")
     print(f"SimpleCNN : Acc={cnn_metrics['accuracy']:.4f}, Rec={cnn_metrics['recall']:.4f}, F1={cnn_metrics['f1']:.4f}")
     print(f"HOG+SVM   : Acc={trad_metrics['accuracy']:.4f}, Rec={trad_metrics['recall']:.4f}, F1={trad_metrics['f1']:.4f}")
     print(f"ResNet18  : Acc={resnet_metrics['accuracy']:.4f}, Rec={resnet_metrics['recall']:.4f}, F1={resnet_metrics['f1']:.4f}")

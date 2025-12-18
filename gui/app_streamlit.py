@@ -21,34 +21,28 @@ from sklearn.metrics import (
 )
 import matplotlib.pyplot as plt
 
-import cv2  # 用于图像预处理
-
+import cv2  # OpenCV preprocessing
 from joblib import load
 
-# 可选：画布输入
+# Optional canvas input (only if dependency is installed)
 try:
     from streamlit_drawable_canvas import st_canvas
     HAS_CANVAS = True
 except ImportError:
     HAS_CANVAS = False
 
-# -------------- project path --------------
+# Add project root to Python path for local imports
 BASE_DIR = Path(__file__).resolve().parents[1]
 if str(BASE_DIR) not in sys.path:
     sys.path.append(str(BASE_DIR))
-# -----------------------------------------
 
 from models.cnn import SimpleCNN
 from utils.datasets import preprocess_numpy_to_tensor
 from utils.traditional import hog_from_numpy
 
 
-# ---------------- Metric helpers ----------------
-
 def compute_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> Dict[str, float]:
-    """
-    计算 Accuracy、宏平均 Recall 和宏平均 F1-score。
-    """
+    """Compute Accuracy, Macro Recall, and Macro F1."""
     return {
         "accuracy": accuracy_score(y_true, y_pred),
         "recall": recall_score(y_true, y_pred, average="macro"),
@@ -57,9 +51,7 @@ def compute_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> Dict[str, float]:
 
 
 def plot_cm(cm: np.ndarray, title: str):
-    """
-    画混淆矩阵，并返回 matplotlib Figure，方便在 Streamlit 中显示。
-    """
+    """Return a matplotlib figure for the confusion matrix."""
     fig, ax = plt.subplots(figsize=(4, 4))
     disp = ConfusionMatrixDisplay(cm, display_labels=list(range(10)))
     disp.plot(ax=ax, cmap="Blues", values_format="d", colorbar=False)
@@ -68,10 +60,8 @@ def plot_cm(cm: np.ndarray, title: str):
     return fig
 
 
-# ---------------- Utility functions ----------------
-
 def pil_to_cv2_bgr(img_pil: Image.Image) -> np.ndarray:
-    """PIL -> OpenCV BGR"""
+    """Convert PIL image to OpenCV BGR format."""
     img_rgb = np.array(img_pil.convert("RGB"))
     img_bgr = img_rgb[:, :, ::-1]
     return img_bgr
@@ -79,31 +69,27 @@ def pil_to_cv2_bgr(img_pil: Image.Image) -> np.ndarray:
 
 def preprocess_for_resnet_from_processed28(img28: np.ndarray, device: torch.device):
     """
-    已经是 28×28 单通道的 float32 [0,1] 图像，
-    转成 3×224×224 的张量，并做与 ResNet 训练时一致的归一化。
+    Convert 28×28 float image to ResNet input tensor (1,3,224,224),
+    using the same normalization as ResNet training.
     """
     tensor = torch.from_numpy(img28).unsqueeze(0).unsqueeze(0)  # (1,1,28,28)
     tensor = tensor.to(device=device, dtype=torch.float32)
 
     tensor = F.interpolate(
         tensor, size=(224, 224), mode="bilinear", align_corners=False
-    )  # (1,1,224,224)
-    tensor = tensor.expand(-1, 3, -1, -1)  # (1,3,224,224)
+    )
+    tensor = tensor.expand(-1, 3, -1, -1)
 
     tensor = (tensor - 0.5) / 0.5
     return tensor
 
 
 def topk_from_probs(probs: np.ndarray, k: int = 3):
-    """
-    给定概率向量，返回 top-k 的类别及其概率。
-    """
+    """Return top-k class indices and probabilities."""
     k = min(k, probs.shape[0])
     idx = np.argsort(probs)[-k:][::-1]
     return idx, probs[idx]
 
-
-# ---------------- 预处理调试：返回每一步 ----------------
 
 def debug_preprocess_steps(
     img_bgr: np.ndarray,
@@ -111,28 +97,23 @@ def debug_preprocess_steps(
     invert: bool = True,
 ) -> Tuple[np.ndarray, Dict[str, np.ndarray]]:
     """
-    返回 processed28（float 28×28）和所有中间步骤（uint8 图像）
-    用于 GUI 按「Grayscale → Binarization → Unified size → Normalization」展示。
+    Preprocess the image and return:
+    - processed28: float32 (28,28) in [0,1]
+    - steps: intermediate images for UI display
     """
-
-    # Step 1: Grayscale conversion
     gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
-
-    # 轻微高斯模糊去噪
     gray_blur = cv2.GaussianBlur(gray, (3, 3), 0)
 
-    # Step 2: Binarization（Otsu + 反二值化，得到黑底白字）
-    # 对于“上传的白底黑字”图片：使用 THRESH_BINARY_INV + OTSU -> 黑底白字
+    # Otsu thresholding to get white digit on black background
     _, thresh = cv2.threshold(
         gray_blur, 0, 255,
         cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU
     )
 
-    # 如果是画布（已经是黑底白字），可以选择不反，交给 invert 参数控制
+    # Canvas input may already be inverted
     if not invert:
         thresh = 255 - thresh
 
-    # 找非零区域（数字区域）
     coords = cv2.findNonZero(thresh)
     if coords is None:
         blank = np.zeros(output_size, dtype=np.float32)
@@ -145,7 +126,7 @@ def debug_preprocess_steps(
 
     x, y, w, h = cv2.boundingRect(coords)
 
-    # padded 裁剪，防止裁得过紧
+    # Add small padding to avoid cutting digit strokes
     pad = int(0.05 * max(w, h))
     x0 = max(x - pad, 0)
     y0 = max(y - pad, 0)
@@ -154,7 +135,7 @@ def debug_preprocess_steps(
     digit_roi = thresh[y0:y1, x0:x1]
     roi_h, roi_w = digit_roi.shape
 
-    # Step 3: Unified image size（裁剪、缩放、居中到 28×28）
+    # Resize and center into a fixed 28×28 canvas
     target_h, target_w = output_size
     scale = min(target_w / roi_w, target_h / roi_h)
     new_w = int(roi_w * scale)
@@ -169,21 +150,19 @@ def debug_preprocess_steps(
     y_offset = (target_h - new_h) // 2
     canvas[y_offset:y_offset + new_h, x_offset:x_offset + new_w] = digit_resized
 
-    # Step 4: Normalization（0–255 -> 0–1 float）
     processed28 = canvas.astype(np.float32) / 255.0
 
     steps = {
-        "gray": gray,          # Step 1
-        "thresh": thresh,      # Step 2
-        "canvas": canvas,      # Step 3（统一尺寸）
+        "gray": gray,
+        "thresh": thresh,
+        "canvas": canvas,
     }
     return processed28, steps
 
 
-# ---------------- Model loading (cached) ----------------
-
 @st.cache_resource
 def load_cnn_model(device: torch.device):
+    """Load the best SimpleCNN weights once per session."""
     model_path = BASE_DIR / "models" / "cnn_best.pth"
     model = SimpleCNN(num_classes=10)
     state_dict = torch.load(model_path, map_location=device)
@@ -195,6 +174,7 @@ def load_cnn_model(device: torch.device):
 
 @st.cache_resource
 def load_resnet_model(device: torch.device):
+    """Load the best ResNet18 weights once per session."""
     model_path = BASE_DIR / "models" / "resnet18_mnist.pth"
     model = models.resnet18(weights=None)
     in_features = model.fc.in_features
@@ -208,17 +188,14 @@ def load_resnet_model(device: torch.device):
 
 @st.cache_resource
 def load_traditional_model():
+    """Load the trained HOG+SVM pipeline once per session."""
     model_path = BASE_DIR / "models" / "traditional_hog_svm.joblib"
     clf = load(model_path)
     return clf
 
 
-# ---------------- Single image prediction ----------------
-
 def predict_cnn(processed28: np.ndarray, device: torch.device):
-    """
-    processed28: float32 (28,28), [0,1]
-    """
+    """Predict digit and probabilities using SimpleCNN."""
     model = load_cnn_model(device)
     tensor = preprocess_numpy_to_tensor(processed28, device=device)
     with torch.no_grad():
@@ -228,9 +205,7 @@ def predict_cnn(processed28: np.ndarray, device: torch.device):
 
 
 def predict_resnet(processed28: np.ndarray, device: torch.device):
-    """
-    processed28: float32 (28,28), [0,1]
-    """
+    """Predict digit and probabilities using ResNet18."""
     model = load_resnet_model(device)
     tensor = preprocess_for_resnet_from_processed28(processed28, device)
     with torch.no_grad():
@@ -240,31 +215,31 @@ def predict_resnet(processed28: np.ndarray, device: torch.device):
 
 
 def predict_traditional(processed28: np.ndarray):
-    """
-    processed28: float32 (28,28), [0,1]
-    """
+    """Predict digit using HOG features and SVM (no probabilities)."""
     clf = load_traditional_model()
     feat = hog_from_numpy(processed28).reshape(1, -1)
     pred = clf.predict(feat)[0]
     return int(pred)
 
-# ---------------- Real-time MNIST evaluation ----------------
 
 @st.cache_data(show_spinner=True)
 def evaluate_cnn(test_samples: int, device_str: str):
     """
-    返回：metrics(dict: accuracy/recall/f1) + confusion matrix
+    Evaluate on MNIST official test set using a deterministic subset (first N samples).
     """
     device = torch.device(device_str)
     data_root = BASE_DIR / "data"
 
     transform = transforms.Compose([
         transforms.ToTensor(),
-        transforms.Normalize((0.1307,), (0.3081,))
+        transforms.Normalize((0.1307,), (0.3081,))  # Match CNN training normalization
     ])
 
     full_test = datasets.MNIST(root=data_root, train=False, download=True, transform=transform)
-    ds = Subset(full_test, range(min(test_samples, len(full_test))))
+
+    n = min(test_samples, len(full_test))
+    ds = Subset(full_test, range(n))  # Deterministic subset
+
     loader = DataLoader(ds, batch_size=128, shuffle=False, num_workers=0)
 
     model = load_cnn_model(device)
@@ -289,13 +264,16 @@ def evaluate_cnn(test_samples: int, device_str: str):
 @st.cache_data(show_spinner=True)
 def evaluate_traditional(test_samples: int):
     """
-    HOG+SVM：返回 metrics + confusion matrix
+    Evaluate on MNIST official test set using a deterministic subset (first N samples).
     """
     data_root = BASE_DIR / "data"
     transform = transforms.ToTensor()
+
     full_test = datasets.MNIST(root=data_root, train=False, download=True, transform=transform)
 
-    ds = Subset(full_test, range(min(test_samples, len(full_test))))
+    n = min(test_samples, len(full_test))
+    ds = Subset(full_test, range(n))  # Deterministic subset
+
     clf = load_traditional_model()
 
     feats, labels = [], []
@@ -316,7 +294,7 @@ def evaluate_traditional(test_samples: int):
 @st.cache_data(show_spinner=True)
 def evaluate_resnet(test_samples: int, device_str: str):
     """
-    ResNet18：返回 metrics + confusion matrix
+    Evaluate on MNIST official test set using a deterministic subset (first N samples).
     """
     device = torch.device(device_str)
     data_root = BASE_DIR / "data"
@@ -325,11 +303,14 @@ def evaluate_resnet(test_samples: int, device_str: str):
         transforms.Resize((224, 224)),
         transforms.ToTensor(),
         transforms.Lambda(lambda x: x.expand(3, -1, -1)),
-        transforms.Normalize([0.5] * 3, [0.5] * 3),
+        transforms.Normalize([0.5] * 3, [0.5] * 3),  # Match ResNet training normalization
     ])
 
     full_test = datasets.MNIST(root=data_root, train=False, download=True, transform=transform)
-    ds = Subset(full_test, range(min(test_samples, len(full_test))))
+
+    n = min(test_samples, len(full_test))
+    ds = Subset(full_test, range(n))  # Deterministic subset
+
     loader = DataLoader(ds, batch_size=64, shuffle=False, num_workers=0)
 
     model = load_resnet_model(device)
@@ -351,8 +332,6 @@ def evaluate_resnet(test_samples: int, device_str: str):
     return metrics, cm
 
 
-# ---------------- Streamlit UI ----------------
-
 def main():
     st.set_page_config(page_title="Handwritten Digit Recognition", layout="wide")
 
@@ -368,7 +347,6 @@ def main():
     device_str = str(device)
     st.sidebar.write(f"**Device:** {device}")
 
-    # ------------- Model selection -------------
     st.sidebar.subheader("Model selection")
     model_name = st.sidebar.selectbox("Choose model", ["SimpleCNN", "ResNet18", "HOG + SVM"])
     show_probs = st.sidebar.checkbox("Show probability bar chart (CNN / ResNet)", True)
@@ -378,7 +356,6 @@ def main():
     trad_n = st.sidebar.slider("HOG+SVM test samples", 1000, 5000, 2000, 1000)
     resnet_n = st.sidebar.slider("ResNet test samples", 500, 2000, 1000, 500)
 
-    # ------------- Input area -------------
     col1, col2 = st.columns(2)
 
     original_pil: Optional[Image.Image] = None
@@ -421,8 +398,7 @@ def main():
         else:
             img_bgr = pil_to_cv2_bgr(original_pil)
 
-            # 上传图片通常是白底黑字，需要 invert=True；
-            # 画布已经是黑底白字，invert=False。
+            # Upload: usually white background; Canvas: already inverted
             invert_flag = True if mode == "Upload image" else False
 
             processed28, steps = debug_preprocess_steps(
@@ -431,27 +407,18 @@ def main():
                 invert=invert_flag
             )
 
-            # ---- Step 1: Grayscale conversion ----
             st.markdown("### Step 1: Grayscale conversion")
-            st.write("Convert the input image from color (BGR) to a single-channel grayscale image.")
             st.image(steps["gray"], caption="Grayscale image", width=200)
 
-            # ---- Step 2: Binarization ----
             st.markdown("### Step 2: Binarization")
-            st.write("Apply Otsu's thresholding to obtain a clear black-and-white digit (black background, white digit).")
             st.image(steps["thresh"], caption="Binary image", width=200)
 
-            # ---- Step 3: Unified image size ----
             st.markdown("### Step 3: Unified image size (28×28)")
-            st.write("Resize the digit while keeping aspect ratio, then center it on a fixed 28×28 canvas.")
             st.image(steps["canvas"], caption="Centered 28×28 canvas", width=200)
 
-            # ---- Step 4: Normalization ----
             st.markdown("### Step 4: Normalization")
-            st.write("Normalize pixel values from [0, 255] to [0, 1] as the final model input.")
-            st.image(processed28, caption="Normalized 28×28 (float32, [0,1])", width=200)
+            st.image(processed28, caption="Normalized 28×28 ([0,1])", width=200)
 
-            # ------------- Prediction -------------
             st.markdown("---")
             st.subheader("3. Prediction")
 
@@ -475,9 +442,8 @@ def main():
                 else:
                     pred = predict_traditional(processed28)
                     st.success(f"HOG + SVM Prediction: {pred}")
-                    st.info("No probability output for SVM.")
+                    st.info("SVM does not provide class probabilities here.")
 
-    # ---------------- Model comparison ----------------
     st.markdown("---")
     st.header("Model comparison (same input)")
 
@@ -502,7 +468,6 @@ def main():
     else:
         st.info("Upload or draw an image to compare models.")
 
-    # ---------------- Real-time evaluation ----------------
     st.markdown("---")
     st.header("Real-time MNIST evaluation")
 
@@ -513,7 +478,6 @@ def main():
             resnet_metrics, cm_resnet = evaluate_resnet(resnet_n, device_str)
 
         st.subheader("Evaluation Metrics (MNIST test subsets)")
-
         st.table({
             "Model": ["SimpleCNN", "HOG+SVM", "ResNet18"],
             "Samples": [cnn_n, trad_n, resnet_n],
@@ -542,22 +506,18 @@ def main():
             st.pyplot(plot_cm(cm_trad, "HOG + SVM"))
         with c3:
             st.pyplot(plot_cm(cm_resnet, "ResNet18"))
-        # ---------------- Performance Curves ----------------
+
         st.markdown("---")
         st.header("Performance Curves")
 
         st.write(
-            "Here we show pre-computed training and validation curves as well as "
-            "learning curves for the three models. These figures are generated "
-            "offline in the training scripts and loaded here for visualization."
+            "The following figures are generated offline by training scripts "
+            "and displayed here for reference."
         )
 
         curves_dir = BASE_DIR / "experiments"
-
-        # 一行三列：CNN / HOG+SVM / ResNet
         col_cnn, col_trad, col_res = st.columns(3)
 
-        # ----- SimpleCNN 曲线 -----
         with col_cnn:
             st.subheader("SimpleCNN")
             cnn_curve_path = curves_dir / "cnn_training_curves.png"
@@ -566,16 +526,14 @@ def main():
             else:
                 st.info("cnn_training_curves.png not found in experiments/")
 
-        # ----- HOG+SVM 曲线（learning curve） -----
         with col_trad:
             st.subheader("HOG + SVM")
             hog_curve_path = curves_dir / "hog_svm_learning_curve.png"
             if hog_curve_path.exists():
-                st.image(str(hog_curve_path), caption="Learning Curve (train size vs CV accuracy)", use_container_width=True)
+                st.image(str(hog_curve_path), caption="Learning Curve", use_container_width=True)
             else:
                 st.info("hog_svm_learning_curve.png not found in experiments/")
 
-        # ----- ResNet18 曲线 -----
         with col_res:
             st.subheader("ResNet18")
             resnet_curve_path = curves_dir / "resnet_training_curves.png"
@@ -583,6 +541,7 @@ def main():
                 st.image(str(resnet_curve_path), caption="Training & Validation Curves", use_container_width=True)
             else:
                 st.info("resnet_training_curves.png not found in experiments/")
+
 
 if __name__ == "__main__":
     main()

@@ -20,7 +20,7 @@ from torchvision import datasets, transforms
 
 import matplotlib.pyplot as plt
 
-# Make sure we can import from project root
+# Add project root to Python path for local imports
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.dirname(CURRENT_DIR)
 if PROJECT_ROOT not in sys.path:
@@ -30,25 +30,14 @@ from utils.traditional import hog_from_tensor
 from joblib import dump
 
 
-# ======================================
-# 1. 构建 HOG 特征
-# ======================================
-
 def build_mnist_hog_features(
     data_root: str,
     max_train_samples: int = 20000,
     max_test_samples: int = 5000
 ):
     """
-    Load MNIST dataset and compute HOG features for a subset of samples.
-
-    Args:
-        data_root: folder to store MNIST data.
-        max_train_samples: limit number of training samples (for speed).
-        max_test_samples: limit number of test samples.
-
-    Returns:
-        X_train, y_train, X_test, y_test (all numpy arrays)
+    Load MNIST and extract HOG features for a limited number of samples.
+    Returns numpy arrays for training and testing.
     """
     transform = transforms.ToTensor()
 
@@ -65,19 +54,18 @@ def build_mnist_hog_features(
         transform=transform
     )
 
-    # Limit dataset size for faster training
+    # Use subsets for faster feature extraction and training
     train_size = min(len(train_dataset), max_train_samples)
     test_size = min(len(test_dataset), max_test_samples)
 
     print(f"Using {train_size} training samples, {test_size} test samples for HOG+SVM.")
 
-    # Initialize arrays
     X_train_list = []
     y_train_list = []
 
     print("Extracting HOG features for training set...")
     for i in tqdm(range(train_size)):
-        img_tensor, label = train_dataset[i]  # img_tensor: (1, 28, 28)
+        img_tensor, label = train_dataset[i]  # img_tensor shape: (1, 28, 28)
         features = hog_from_tensor(img_tensor)
         X_train_list.append(features)
         y_train_list.append(label)
@@ -106,7 +94,7 @@ def build_mnist_hog_features(
 
 def build_svm_pipeline() -> Pipeline:
     """
-    构建 HOG + SVM 分类器的 pipeline：StandardScaler + RBF-SVM
+    HOG + SVM pipeline: feature scaling + RBF SVM classifier.
     """
     clf = Pipeline([
         ("scaler", StandardScaler()),
@@ -114,10 +102,6 @@ def build_svm_pipeline() -> Pipeline:
     ])
     return clf
 
-
-# ======================================
-# 2. 单次训练 + 测试（baseline）
-# ======================================
 
 def train_and_evaluate_baseline(
     X_train: np.ndarray,
@@ -127,7 +111,8 @@ def train_and_evaluate_baseline(
     model_save_path: str,
 ):
     """
-    单次训练 HOG+SVM，并在测试集上输出 Accuracy / Recall / F1 / Confusion Matrix，保存模型。
+    Train one HOG+SVM model on the training set and evaluate on the test set.
+    Saves the fitted pipeline for later use.
     """
     print("\n=== Baseline: Train HOG + SVM classifier on training set ===")
     clf = build_svm_pipeline()
@@ -147,11 +132,11 @@ def train_and_evaluate_baseline(
     print(f"  F1-score : {f1:.4f}")
     print(f"  Confusion matrix shape: {cm.shape}")
 
-    # Save model
+    # Save the trained pipeline as a single file
     dump(clf, model_save_path)
     print(f"Traditional model saved to: {model_save_path}")
 
-    # 顺便画一个简单的 confusion matrix 图（可选）
+    # Save confusion matrix figure for the report
     cm_fig_path = os.path.join(PROJECT_ROOT, "experiments", "hog_svm_confusion.png")
     plot_confusion_matrix(cm, cm_fig_path)
 
@@ -160,7 +145,7 @@ def train_and_evaluate_baseline(
 
 def plot_confusion_matrix(cm: np.ndarray, save_path: str):
     """
-    绘制并保存混淆矩阵。
+    Plot and save the confusion matrix.
     """
     from sklearn.metrics import ConfusionMatrixDisplay
     import matplotlib.pyplot as plt
@@ -175,39 +160,29 @@ def plot_confusion_matrix(cm: np.ndarray, save_path: str):
     print(f"Confusion matrix saved to: {save_path}")
 
 
-# ======================================
-# 3. k-fold Cross Validation + 学习曲线
-# ======================================
-
 def run_kfold_cross_validation_hog_svm(
     X: np.ndarray,
     y: np.ndarray,
     k_folds: int = 5,
 ):
     """
-    对 HOG+SVM 进行 Stratified k-fold cross validation。
-    这里我们使用 sklearn 的 learning_curve 来记录:
-        - train_sizes
-        - train_scores
-        - val_scores (cross-validation)
-    然后画出“学习曲线”：train size vs. accuracy。
+    Compute a learning curve using stratified k-fold cross validation.
+    The curve shows accuracy vs. number of training samples.
     """
     print(f"\n=== Running {k_folds}-fold Cross Validation for HOG + SVM ===")
 
     clf = build_svm_pipeline()
 
-    # 使用 learning_curve 自动做 k-fold CV 并计算不同训练集大小下的性能
     train_sizes, train_scores, val_scores = learning_curve(
         clf,
         X,
         y,
         cv=StratifiedKFold(n_splits=k_folds, shuffle=True, random_state=42),
         scoring="accuracy",
-        train_sizes=np.linspace(0.1, 1.0, 5),  # 5 个点：10%、25%、50%、75%、100%
+        train_sizes=np.linspace(0.1, 1.0, 5),
         n_jobs=-1,
     )
 
-    # 取平均和标准差
     train_scores_mean = train_scores.mean(axis=1)
     train_scores_std = train_scores.std(axis=1)
     val_scores_mean = val_scores.mean(axis=1)
@@ -216,7 +191,6 @@ def run_kfold_cross_validation_hog_svm(
     print("\nTrain sizes:", train_sizes)
     print("CV mean accuracies (val):", [f"{s:.4f}" for s in val_scores_mean])
 
-    # 画学习曲线
     curve_path = os.path.join(PROJECT_ROOT, "experiments", "hog_svm_learning_curve.png")
     plot_learning_curve(
         train_sizes,
@@ -239,14 +213,13 @@ def plot_learning_curve(
     title: str = "Learning Curve",
 ):
     """
-    绘制学习曲线：训练样本数量 vs. 准确率（train / validation）。
+    Plot training and cross-validation accuracy with standard deviation bands.
     """
     plt.figure(figsize=(6, 4))
     plt.title(title)
     plt.xlabel("Training examples")
     plt.ylabel("Accuracy")
 
-    # 训练集曲线
     plt.fill_between(
         train_sizes,
         train_scores_mean - train_scores_std,
@@ -256,7 +229,6 @@ def plot_learning_curve(
     )
     plt.plot(train_sizes, train_scores_mean, "o-", label="Train Accuracy")
 
-    # 验证集曲线
     plt.fill_between(
         train_sizes,
         val_scores_mean - val_scores_std,
@@ -274,10 +246,6 @@ def plot_learning_curve(
     print(f"Learning curve saved to: {save_path}")
 
 
-# ======================================
-# 4. Bootstrap 重采样评估
-# ======================================
-
 def run_bootstrap_hog_svm(
     X: np.ndarray,
     y: np.ndarray,
@@ -286,10 +254,8 @@ def run_bootstrap_hog_svm(
     num_bootstrap: int = 5,
 ):
     """
-    Bootstrap 重采样：
-      - 每次在 (X, y) 上有放回抽样 N 个样本，训练一个 SVM
-      - 在固定 test set (X_test, y_test) 上评估
-      - 得到一组 test accuracy 分布
+    Bootstrap evaluation:
+    train on bootstrap samples and evaluate on a fixed test set.
     """
     print(f"\n=== Bootstrap evaluation for HOG + SVM (B={num_bootstrap}) ===")
     N = X.shape[0]
@@ -318,34 +284,30 @@ def run_bootstrap_hog_svm(
     print(f"Mean Acc: {mean_acc:.4f} ± {std_acc:.4f}")
 
 
-# ======================================
-# 5. main
-# ======================================
-
 def main():
     data_root = os.path.join(PROJECT_ROOT, "data")
     model_save_path = os.path.join(PROJECT_ROOT, "models", "traditional_hog_svm.joblib")
 
-    # 1) 提取 HOG 特征
+    # Extract HOG features from MNIST subsets
     X_train, y_train, X_test, y_test = build_mnist_hog_features(
         data_root=data_root,
-        max_train_samples=20000,  # you can increase later if training is fast enough
+        max_train_samples=20000,
         max_test_samples=5000
     )
 
-    # 2) 单次 baseline 训练 + 测试（并保存模型）
-    baseline_acc, baseline_rec, baseline_f1, baseline_cm = train_and_evaluate_baseline(
+    # Baseline training and evaluation on the test subset
+    train_and_evaluate_baseline(
         X_train, y_train, X_test, y_test, model_save_path
     )
 
-    # 3) Stratified k-fold Cross Validation + 学习曲线
+    # Learning curve using stratified k-fold cross validation
     run_kfold_cross_validation_hog_svm(
         X=X_train,
         y=y_train,
         k_folds=5,
     )
 
-    # 4) Bootstrap 重采样评估
+    # Bootstrap evaluation on a fixed test subset
     run_bootstrap_hog_svm(
         X=X_train,
         y=y_train,

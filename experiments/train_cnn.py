@@ -9,7 +9,7 @@ from torch.utils.data import DataLoader
 
 import matplotlib.pyplot as plt
 
-# Make sure we can import from project root
+# Add project root to Python path for local imports
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.dirname(CURRENT_DIR)
 if PROJECT_ROOT not in sys.path:
@@ -26,7 +26,7 @@ def train_one_epoch(
     optimizer: optim.Optimizer,
     device: torch.device
 ) -> Dict[str, float]:
-    model.train()
+    model.train()  # Enable training mode
     running_loss = 0.0
     correct = 0
     total = 0
@@ -42,15 +42,11 @@ def train_one_epoch(
         optimizer.step()
 
         running_loss += loss.item() * images.size(0)
-
         _, predicted = outputs.max(1)
         correct += (predicted == labels).sum().item()
         total += labels.size(0)
 
-    epoch_loss = running_loss / total
-    epoch_acc = correct / total
-
-    return {"loss": epoch_loss, "acc": epoch_acc}
+    return {"loss": running_loss / total, "acc": correct / total}
 
 
 def evaluate(
@@ -59,12 +55,12 @@ def evaluate(
     criterion: nn.Module,
     device: torch.device
 ) -> Dict[str, float]:
-    model.eval()
+    model.eval()  # Evaluation mode, no parameter updates
     running_loss = 0.0
     correct = 0
     total = 0
 
-    with torch.no_grad():
+    with torch.no_grad():  # Disable gradients for evaluation
         for images, labels in dataloader:
             images = images.to(device)
             labels = labels.to(device)
@@ -73,26 +69,18 @@ def evaluate(
             loss = criterion(outputs, labels)
 
             running_loss += loss.item() * images.size(0)
-
             _, predicted = outputs.max(1)
             correct += (predicted == labels).sum().item()
             total += labels.size(0)
 
-    epoch_loss = running_loss / total
-    epoch_acc = correct / total
-
-    return {"loss": epoch_loss, "acc": epoch_acc}
+    return {"loss": running_loss / total, "acc": correct / total}
 
 
 def plot_history(history: Dict[str, List[float]], save_path: str) -> None:
-    """
-    Plot training and validation loss/accuracy curves and save to file.
-    """
     epochs = range(1, len(history["train_loss"]) + 1)
 
     plt.figure(figsize=(10, 4))
 
-    # Loss
     plt.subplot(1, 2, 1)
     plt.plot(epochs, history["train_loss"], label="Train Loss")
     plt.plot(epochs, history["val_loss"], label="Val Loss")
@@ -101,7 +89,6 @@ def plot_history(history: Dict[str, List[float]], save_path: str) -> None:
     plt.legend()
     plt.title("Loss")
 
-    # Accuracy
     plt.subplot(1, 2, 2)
     plt.plot(epochs, history["train_acc"], label="Train Acc")
     plt.plot(epochs, history["val_acc"], label="Val Acc")
@@ -113,83 +100,55 @@ def plot_history(history: Dict[str, List[float]], save_path: str) -> None:
     plt.tight_layout()
     plt.savefig(save_path)
     plt.close()
-    print(f"Training curves saved to: {save_path}")
 
 
 def main():
-    # =========================
-    # 1. Basic configuration
-    # =========================
     batch_size = 64
-    num_epochs = 2
+    num_epochs = 10
     learning_rate = 1e-3
 
-    # Select device
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
 
-    # Output paths
     model_save_path = os.path.join(PROJECT_ROOT, "models", "cnn_best.pth")
     curves_save_path = os.path.join(PROJECT_ROOT, "experiments", "cnn_training_curves.png")
 
-    # =========================
-    # 2. Data loaders
-    # =========================
-    train_loader, test_loader = get_mnist_dataloaders(
+    # Load MNIST with explicit train / validation / test split
+    train_loader, val_loader, test_loader = get_mnist_dataloaders(
         data_root=os.path.join(PROJECT_ROOT, "data"),
         batch_size=batch_size,
         num_workers=2,
-        use_augmentation=True
+        use_augmentation=True,
+        val_split=0.1,
+        seed=42
     )
 
-    # =========================
-    # 3. Model, loss, optimizer
-    # =========================
     model = SimpleCNN(num_classes=10).to(device)
     criterion = nn.CrossEntropyLoss()
     optimizer = optim.Adam(model.parameters(), lr=learning_rate)
 
-    history = {
-        "train_loss": [],
-        "train_acc": [],
-        "val_loss": [],
-        "val_acc": [],
-    }
-
+    history = {"train_loss": [], "train_acc": [], "val_loss": [], "val_acc": []}
     best_val_acc = 0.0
 
-    # =========================
-    # 4. Training loop
-    # =========================
     for epoch in range(1, num_epochs + 1):
-        print(f"\nEpoch [{epoch}/{num_epochs}]")
-
         train_metrics = train_one_epoch(model, train_loader, criterion, optimizer, device)
-        val_metrics = evaluate(model, test_loader, criterion, device)
+        val_metrics = evaluate(model, val_loader, criterion, device)  # Use validation set
 
         history["train_loss"].append(train_metrics["loss"])
         history["train_acc"].append(train_metrics["acc"])
         history["val_loss"].append(val_metrics["loss"])
         history["val_acc"].append(val_metrics["acc"])
 
-        print(f"Train Loss: {train_metrics['loss']:.4f}, Train Acc: {train_metrics['acc']:.4f}")
-        print(f" Val  Loss: {val_metrics['loss']:.4f},  Val  Acc: {val_metrics['acc']:.4f}")
-
-        # Save best model
+        # Save model based on validation accuracy only
         if val_metrics["acc"] > best_val_acc:
             best_val_acc = val_metrics["acc"]
             torch.save(model.state_dict(), model_save_path)
-            print(f"New best model saved with val_acc = {best_val_acc:.4f}")
 
-    # =========================
-    # 5. Plot training curves
-    # =========================
     plot_history(history, curves_save_path)
 
-    print(f"\nTraining finished. Best validation accuracy: {best_val_acc:.4f}")
-    print(f"Best model saved to: {model_save_path}")
+    # Final test evaluation (not used for model selection)
+    test_metrics = evaluate(model, test_loader, criterion, device)
+    print(f"Test Acc: {test_metrics['acc']:.4f}")
 
 
 if __name__ == "__main__":
     main()
-
